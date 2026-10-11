@@ -27,6 +27,20 @@ param(
 $ErrorActionPreference = 'Stop'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# ---- 路径自动发现 ----
+function Redact($p) {
+  if (-not $p) { return $p }
+  foreach ($e in 'LOCALAPPDATA','APPDATA','ProgramData','USERPROFILE') {
+    $base = [Environment]::GetEnvironmentVariable($e)
+    if ($base -and $p.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { return "%$e%" + $p.Substring($base.Length) }
+  }
+  return $p
+}
+$P = (node "$Here\paths-cli.mjs" --json) | ConvertFrom-Json
+if (-not $P.ok) { node "$Here\paths-cli.mjs"; throw "环境不满足（可用 --data-dir 或 ROXY_HOME 指定）" }
+Write-Host "[env] 数据目录 $(Redact $P.dataDir)" -ForegroundColor DarkGray
+Write-Host "[env] 内核 v$($P.coreVersion)" -ForegroundColor DarkGray
+
 # ---------- 1. generate ----------
 $mkArgs = @("$Here\mkprofile.mjs", '--count', $Count)
 if ($Name)  { $mkArgs += @('--name',  $Name) }

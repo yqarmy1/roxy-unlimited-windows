@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
-import { createProfileOnDisk, CACHE, coreExe, profileDir, ROOT, EXT_DIR } from './fingerprint.mjs';
+import { createProfileOnDisk, getPaths, coreExe, profileDir } from './fingerprint.mjs';
+const PATHS = getPaths();
 
 const NOISE_SRC = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), 'noise-ext');
 const EXE = coreExe();
@@ -14,14 +15,14 @@ const dirId = built.dirId;
 
 // 手写一份与 roxy-api 相同的逐档案扩展副本
 const seed = crypto.createHash('sha256').update('diag|' + dirId).digest().readUInt32BE(0);
-const noiseDir = path.join(ROOT, 'temp', 'profile-noise', dirId);
+const noiseDir = path.join(PATHS.dataDir, 'temp', 'profile-noise', dirId);
 fs.mkdirSync(noiseDir, { recursive: true });
 fs.writeFileSync(path.join(noiseDir, 'noise.js'), fs.readFileSync(path.join(NOISE_SRC, 'noise.js'), 'utf8').replace('__SEED__', String(seed >>> 0)));
 for (const f of ['manifest.json', 'bg.js']) fs.copyFileSync(path.join(NOISE_SRC, f), path.join(noiseDir, f));
 
 const variants = {
   'only-noise-ext':            [`--load-extension=${noiseDir}`],
-  'both-ext-comma':            [`--load-extension=${EXT_DIR},${noiseDir}`],
+  'both-ext-comma':            [`--load-extension=${PATHS.extensionDir},${noiseDir}`],
   'noise-via-disable-except':  [`--load-extension=${noiseDir}`, `--disable-extensions-except=${noiseDir}`],
 };
 

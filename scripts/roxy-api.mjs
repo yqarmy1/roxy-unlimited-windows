@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import {
-  ROOT, CACHE, INSTALL, EXT_DIR, LOCALE_PRESETS, SCREENS, WINDOWS_PROFILES,
+  getPaths, pathHelp, show, LOCALE_PRESETS, SCREENS, WINDOWS_PROFILES,
   coreExe, coreVersion, lumiPath, profileDir, hasProfile, isDirId,
   readFingerprint, createProfileOnDisk,
 } from './fingerprint.mjs';
@@ -31,8 +31,12 @@ const HEADLESS  = argv.includes('--headless-default');
 const WORKBENCH = argv.includes('--workbench-default');
 const APP_PORT  = parseInt(argOf('app-port', '45535'), 10);
 const DEF_LOCALE = argOf('locale', null);
+const FULL_PATHS = argv.includes('--full-paths');   // 默认脱敏显示路径
 
-const DRIVER = () => path.join(path.dirname(coreExe()), 'chromedriver.exe');
+// 路径自动发现：--data-dir / --install-dir / ROXY_HOME / ROXY_INSTALL / 常见位置 / 注册表 / 运行中进程
+const PATHS = getPaths({ dataDir: argOf('data-dir'), installDir: argOf('install-dir') });
+
+const DRIVER = () => PATHS.chromedriver ?? path.join(path.dirname(coreExe()), 'chromedriver.exe');
 const windowNameOf = (dirId) => readFingerprint(dirId)?.windowName || dirId.slice(0, 8);
 
 // ---------- per-profile canvas/audio noise via CDP ----------
@@ -43,7 +47,7 @@ const windowNameOf = (dirId) => readFingerprint(dirId)?.windowName || dirId.slic
 // mechanism Playwright uses. It survives detach for the lifetime of each target.
 const NOISE_SRC_DIR = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), 'noise-ext');
 const NOISE_SRC = path.join(NOISE_SRC_DIR, 'noise.js');
-const NOISE_TEMP = path.join(ROOT, 'temp', 'profile-noise');
+const NOISE_TEMP = path.join(PATHS.tempDir ?? process.cwd(), 'profile-noise');
 const noiseSource = (dirId, fp) => {
   const seedSource = String(fp?.canvasContext?.canvasContextNoiseValue ?? '') + '|' + dirId;
   const seed = crypto.createHash('sha256').update(seedSource).digest().readUInt32BE(0);
@@ -171,7 +175,7 @@ async function launchWindow(dirId, opts = {}) {
   if (useWorkbench) args.push(`http://127.0.0.1:${APP_PORT}/dashboard.html?id=${dirId}&workspaceType=0`);
 
   const exts = [];
-  if (fs.existsSync(EXT_DIR)) exts.push(EXT_DIR);           // vendor automation-control
+  if (PATHS.extensionDir) exts.push(PATHS.extensionDir);           // vendor automation-control
   exts.push(materializeNoiseExt(dirId, fp));                // our per-profile noise
   args.push(`--load-extension=${exts.join(',')}`);
 
@@ -272,7 +276,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/browser/list') {
-      const rows = fs.readdirSync(CACHE, { withFileTypes: true })
+      const rows = fs.readdirSync(PATHS.browserCacheDir, { withFileTypes: true })
         .filter((e) => e.isDirectory() && hasProfile(e.name))
         .map((e, i) => {
           const fp = readFingerprint(e.name) ?? {};
@@ -388,11 +392,23 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   });
 }
 
+// ---------- 启动前置检查：环境不对就别假装能跑 ----------
+if (!PATHS.ok) {
+  console.error(pathHelp(undefined, FULL_PATHS));
+  console.error('提示：可用 --data-dir <路径> 或环境变量 ROXY_HOME 手动指定数据目录。\n');
+  process.exit(2);
+}
+
 server.listen(PORT, '127.0.0.1', () => {
+  const s = (p) => show(p, FULL_PATHS);   // 默认把用户名换成 %USERPROFILE% 之类的占位符
   console.log(`[roxy-api] listening on http://127.0.0.1:${PORT}`);
-  console.log(`[roxy-api] core        : ${coreExe()}`);
-  console.log(`[roxy-api] profile base: ${CACHE}`);
+  console.log(`[roxy-api] core        : ${s(PATHS.coreExe)}  (v${PATHS.coreVersion})`);
+  console.log(`[roxy-api] data dir    : ${s(PATHS.dataDir)}`);
+  console.log(`[roxy-api] profile base: ${s(PATHS.browserCacheDir)}`);
+  console.log(`[roxy-api] install dir : ${s(PATHS.installDir) ?? '(未找到 — 官方扩展与拦截页将不可用，不影响启动)'}`);
+  console.log(`[roxy-api] chromedriver: ${s(PATHS.chromedriver) ?? '(未找到)'}`);
   console.log(`[roxy-api] quota       : NONE — windows are resolved locally, no server call`);
   console.log(`[roxy-api] headless default: ${HEADLESS}   workbench default: ${WORKBENCH}`);
   console.log(`[roxy-api] default locale  : ${DEF_LOCALE ?? '(none — inherit template)'}`);
+  if (!FULL_PATHS) console.log(`[roxy-api] 路径已脱敏显示，加 --full-paths 看真实路径`);
 });

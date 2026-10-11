@@ -33,7 +33,7 @@
 - **第三部分 API 完整参考** —— 启动、端点、参数
 - **第四部分 接自动化工具** —— Playwright / Puppeteer / Selenium / 裸 CDP
 - **第五部分 任务配方** —— 批量开号、独立代理、复用、收尾
-- **第六部分 必须知道的五个坑**
+- **第六部分 必须知道的六个坑**
 - **第七部分 验证与排错**
 - **第八部分 边界** —— 解除了什么、没解除什么
 
@@ -117,19 +117,60 @@ iv  = "3a105229aa31"                        // 12 字节
 ### 第 1 步 启动 API
 
 ```powershell
-node "%LOCALAPPDATA%\Programs\RoxyBrowser\_reverse\roxy-api.mjs" --port 50001
+node scripts\roxy-api.mjs --port 50001
 ```
 
-启动输出：
+启动输出（**路径全部自动发现，没有写死**）：
 
 ```
 [roxy-api] listening on http://127.0.0.1:50001
-[roxy-api] core        : ...\chrome-bin\152\RoxyChrome.exe
+[roxy-api] core        : ...\chrome-bin\152\RoxyChrome.exe  (v152)
+[roxy-api] data dir    : ...\AppData\Roaming\RoxyBrowser
 [roxy-api] profile base: ...\browser-cache
+[roxy-api] install dir : ...\AppData\Local\Programs\RoxyBrowser
+[roxy-api] chromedriver: ...\chrome-bin\152\chromedriver.exe
 [roxy-api] quota       : NONE — windows are resolved locally, no server call
 ```
 
 **不需要官方 App 运行**（实测：官方 App 完全没运行时，照样建号开窗、指纹注入正常）。
+
+#### 换机器 / 换安装位置
+
+路径按优先级自动搜索（`--data-dir` → `ROXY_HOME` → `%APPDATA%\RoxyBrowser` →
+扫描 `%APPDATA%` 下所有 `roxy*` 目录 → 从运行中进程反推）。手动指定：
+
+```powershell
+node scripts\roxy-api.mjs --port 50001 --data-dir "D:\RoxyData"
+# 或  $env:ROXY_HOME = "D:\RoxyData"
+```
+
+> **显式指定是权威的**：`--data-dir` 无效会**直接报错退出**，不会静默回退到别的目录。
+
+**⚠️ 新机器上第一次跑之前必须先做这一步**：装 RoxyBrowser → 登录 → 在官方界面里打开任意一个窗口，
+让它把内核下载下来。`RoxyChrome.exe` 是官方 App 下载的，**脚本不会生成它**。
+
+环境不满足时脚本会给出人话的失败原因并退出（不再抛裸 `ENOENT`）：
+
+```
+找不到 RoxyBrowser 的运行环境。
+
+  ✓ 数据目录：%APPDATA%\RoxyBrowser
+  ✗ 内核：内核目录不存在：%APPDATA%\RoxyBrowser\chrome-bin
+    RoxyChrome.exe 是官方 App 自己下载的，脚本不会生成它。
+    解决：在这台机器上安装并运行一次 RoxyBrowser，
+          登录后在界面里打开任意一个窗口，让它把内核下载下来。
+          或者从别的机器把 chrome-bin\ 整个目录复制到：
+            %APPDATA%\RoxyBrowser\chrome-bin
+
+  ✓ 安装目录：%LOCALAPPDATA%\Programs\RoxyBrowser
+```
+
+自查命令：
+
+```powershell
+node scripts\paths-cli.mjs            # 人话报告
+node scripts\mkprofile.mjs --list     # 同上，附带可用语言 / 分辨率 / OS 列表
+```
 
 ### 第 2 步 建档案并打开
 
@@ -187,6 +228,9 @@ pwsh -File _reverse\roxy-direct-launch.ps1 -DirId <DIR_ID> -Headless -Workbench
 
 启动参数与官方 `genChromeLaunchCLIArgs()` 逐项对齐（基础参数、`--user-data-dir`、
 `--load-extension`、工作台 URL、窗口尺寸位置）。
+
+启动后会自动把窗口从最小化/隐藏态还原并拉到前台（见坑 6）；不需要就加 `-NoShow`。
+窗口之后又变小了，随时用 `pwsh -File _reverse\roxy-open.ps1` 拉回来。
 
 ## 方法 C：手工理解原理用
 
@@ -501,7 +545,7 @@ $h.data.http
 
 ---
 
-# 第六部分 必须知道的五个坑
+# 第六部分 必须知道的六个坑
 
 ## 坑 1 ⚠️⚠️ 本地端口必须进白名单
 
@@ -572,6 +616,69 @@ RoxyChrome **强制启用端口扫描保护**，不在白名单里的本地端�
 **无头模式下宿主是 800x600**，非常显眼。
 
 本 API 缺省写入具体分辨率，并**用同一组数值设置 `--window-size`**，保证两者不矛盾。
+
+## 坑 6 ⚠️ 直启的窗口是"最小化 / 隐藏"起来的
+
+用 `roxy-direct-launch.ps1`（或任何自己 spawn 内核的方式）开出来的窗口，
+**经常在屏幕上看不见**：窗口对象建好了、标题和尺寸都对、进程也在跑，但屏幕上就是没有。
+
+### 怎么判断
+
+```powershell
+pwsh -File _reverse\roxy-open.ps1 -List
+#   196da5b6...  pid=21388  port=62040  hwnd=858522 visible=True iconic=True
+#                                                              ^^^^^^^^^^^ 最小化
+```
+
+- `visible=False` → 窗口根本没显示（style 里没有 `WS_VISIBLE`）
+- `visible=True iconic=True` → 显示着，但**最小化**在任务栏
+
+两种都表现为"看不到窗口"。
+
+### 三个反直觉的点
+
+1. **不是"等 CDP 连上来才显示"。**
+   实测全新实例、完全没连 CDP 时窗口就已经存在（`visible=True`），只是最小化。
+   官方启动器一上来就 puppeteer attach，所以这个现象永远看不到。
+
+2. **CDP 说"已经好了"是假的。**
+   只发 `Browser.setWindowBounds{windowState:'normal'}` 时，CDP 回报
+   `windowState="normal"`，但 Win32 `IsIconic()` **仍然是 True** ——
+   CDP 只改了 Chromium 的内部模型，没动 OS 窗口。
+   证据脚本：`node _reverse\diag-windowstate.mjs <port>`
+
+3. **`ShowWindow(hwnd, SW_SHOW)` 对最小化窗口无效。**
+   `SW_SHOW`(=5) 不还原最小化窗口，要用 `SW_RESTORE`(=9)。
+   这正是"明明调了 ShowWindow 却毫无反应"的原因。
+
+### 解法
+
+```powershell
+# 还原 + 拉到前台（默认作用于第一个运行中的实例）
+pwsh -File _reverse\roxy-open.ps1
+
+# 指定实例 / 顺便导航 / 指定尺寸
+pwsh -File _reverse\roxy-open.ps1 -DirId <DIR_ID> -Url https://example.com -WindowSize 1600,900
+
+# 只看有哪些实例、各自什么状态
+pwsh -File _reverse\roxy-open.ps1 -List
+```
+
+`roxy-open.ps1` 做两件事：CDP 设 `windowState=normal`（同步内部模型）
+\+ Win32 `SW_RESTORE` / `BringWindowToTop` / `SetForegroundWindow`（真正把窗口拉出来）。
+
+**`roxy-direct-launch.ps1` 已内置这一步**，启动后自动还原窗口；不想要就加 `-NoShow`。
+
+### 附带发现：`DevToolsActivePort` 可能是陈旧的
+
+Chromium **只在 `--remote-debugging-port=0`（自动分配端口）时才写/刷新**
+`<profile>\DevToolsActivePort`。指定固定端口时它不写，目录里那份是上一次运行
+残留的，端口号是错的。
+
+所以判断实例端口要**以命令行里的 `--remote-debugging-port=N` 为准**，
+`roxy-open.ps1` 已经按这个优先级实现。
+
+症状：`roxy-open.ps1 -List` 显示 `port=51452`，实际却监听在 `9335`。
 
 ---
 
@@ -685,10 +792,13 @@ Get-Content "$env:APPDATA\RoxyBrowser\logs\$(Get-Date -Format yyyy-MM-dd).log" -
 | **`fingerprint.mjs`** | 共享指纹合成 + `lumi.conf` 编解码 |
 | **`noise-ext/`** | 按档案实例化的 canvas / 音频噪声扩展 |
 | **`verify-profile.mjs`** | 自校验（建→开→比对→清理） |
-| `roxy-direct-launch.ps1` | 命令行直启器 |
+| `roxy-direct-launch.ps1` | 命令行直启器（启动后自动还原窗口） |
+| `roxy-open.ps1` | **把窗口从最小化/隐藏还原并拉到前台**（见坑 6） |
+| `show-window.mjs` | `roxy-open.ps1` 的 CDP 部分（设 `windowState` + 可选导航） |
 | `roxy-newprofile.ps1` | 一键批量建档案 + 启动 |
 | `mkprofile.mjs` | 离线档案生成器（命令行版） |
 | `cdpcheck.mjs` | 零依赖 CDP 指纹探针 |
+| `diag-windowstate.mjs` | 证明 CDP `windowState` 与 OS 实际状态不一致 |
 | `probe-existing.mjs` | 探测已有档案的指纹 |
 | `lumi.mjs` | `lumi.conf` 编解码（`dump` / `enc`） |
 | `asar.mjs` / `unmap.mjs` / `ctx.mjs` | asar 解包 / sourcemap 还原 / 字节锚点定位 |
@@ -703,7 +813,7 @@ Get-Content "$env:APPDATA\RoxyBrowser\logs\$(Get-Date -Format yyyy-MM-dd).log" -
   chrome-bin\<coreVersion>\chromedriver.exe    自带 driver
   browser-cache\<dirId>\lumi.conf              指纹配置（AES-256-GCM）
   browser-cache\<dirId>\chrome-icon.ico
-  browser-cache\<dirId>\DevToolsActivePort     端口发现文件（内核写）
+  browser-cache\<dirId>\DevToolsActivePort     端口发现文件（仅 --remote-debugging-port=0 时刷新，见坑 6）
   temp\profile-noise\<dirId>\                  按档案的噪声扩展副本
   logs\<YYYY-MM-DD>.log                        官方 App 日志
 ```
@@ -725,6 +835,10 @@ $h | Format-List dirId, windowName, http, ws, driver, locale, timeZone, screen, 
 (Invoke-RestMethod -Uri "$API/browser/connection_info").data | Format-Table dirId, windowName, http, pid
 
 # 用 Playwright 接上去（JS）：  const b = await chromium.connectOverCDP(`http://${handle.http}`);
+
+# 窗口看不见 / 被最小化了 —— 还原并拉到前台
+pwsh -File "%LOCALAPPDATA%\Programs\RoxyBrowser\_reverse\roxy-open.ps1"
+pwsh -File "%LOCALAPPDATA%\Programs\RoxyBrowser\_reverse\roxy-open.ps1" -List   # 先看状态
 
 # 全关
 Invoke-RestMethod -Uri "$API/browser/close_all" -Method POST -ContentType "application/json" -Body '{}'

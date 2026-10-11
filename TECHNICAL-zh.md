@@ -480,7 +480,10 @@ $h.data.http   # 127.0.0.1:xxxxx
 | `fingerprint.mjs` | **共享指纹合成 + `lumi.conf` 编解码**（roxy-api 与 mkprofile 共用同一套随机化） |
 | `noise-ext/` | 按档案实例化的 canvas / 音频噪声扩展（见 §9.5） |
 | `verify-profile.mjs` | 自校验：建档案 → 开 → CDP 逐项比对指纹 → 自动清理并打印 OK/FAIL 表 |
-| `roxy-direct-launch.ps1` | 命令行直启器，参数与官方 `genChromeLaunchCLIArgs()` 对齐 |
+| `roxy-direct-launch.ps1` | 命令行直启器，参数与官方 `genChromeLaunchCLIArgs()` 对齐；**启动后自动还原窗口**（`-NoShow` 关闭） |
+| **`roxy-open.ps1`** | **把窗口从最小化/隐藏还原并拉到前台**（CDP + Win32 两步，见 §14.6） |
+| `show-window.mjs` | `roxy-open.ps1` 的 CDP 部分：设 `windowState` + 可选 `--url` 导航 |
+| `diag-windowstate.mjs` | 证明 CDP `windowState` 与 OS 实际状态不一致（§14.6 复现脚本） |
 | `roxy-newprofile.ps1` | 一键「批量建档案 + 启动 + 健康检查」 |
 | `mkprofile.mjs` | 离线档案生成器（命令行版） |
 | `cdpcheck.mjs` | 零依赖 CDP 探针，读窗口内实际指纹 |
@@ -803,3 +806,43 @@ executablePath：`%APPDATA%\RoxyBrowser\chrome-bin\<cfgVersion>\RoxyChrome.exe`
 | 时区改不掉，要用 `TZ` 环境变量 | 机制错误（键存在，是模板缺失） | 写进 `lumi.conf`，实测生效 |
 | 语言要用 `--lang` / `--accept-lang` | 改错位置 | 用 locale 预设写入 `appLocale`/`acceptLang`，命令行同步下发 |
 | 随机化缩水 + screen 全 0 | 成立 | 抽出共享模块，screen 写具体值并驱动 `--window-size` |
+
+### 14.6 ❌ "窗口看不见是因为内核在等 CDP 客户端 attach"
+
+**结论：不成立。** 窗口启动时就已经是 `visible=True`，只是**最小化**。
+官方启动器一上来就 puppeteer attach，所以这个现象在官方路径下永远观察不到。
+
+实测（全新实例、完全未建立 CDP WS 会话）：
+
+```
+16b2e5fb...  pid=47016  hwnd=6950478  visible=True  iconic=True
+```
+
+跑 `show-window.mjs --attach-only`（只连接、不发任何改变窗口状态的命令）后状态**不变**。
+
+**顺带证伪的第二个假设：** "CDP 的 `Browser.setWindowBounds` 能把窗口还原"也不成立 ——
+
+```
+CDP:   AFTER : {"left":-37,"top":145,...,"windowState":"normal"}
+Win32: iconic=True          ← 仍然最小化
+```
+
+CDP 只更新了 Chromium 的内部窗口模型，**没有动 OS 窗口**。
+真正生效的是 Win32 `ShowWindow(hwnd, SW_RESTORE)`（=9）。
+注意 `SW_SHOW`（=5）**不还原**最小化窗口 —— 这是"调了 `ShowWindow` 却毫无反应"的根因。
+
+复现脚本：`node scripts\diag-windowstate.mjs <port>`（配合 `pwsh -File scripts\roxy-open.ps1 -List` 看 OS 侧状态）。
+
+**修复：** `roxy-open.ps1` 用 CDP + Win32 两步还原并置前；
+`roxy-direct-launch.ps1` 启动后自动调用它（`-NoShow` 可关闭）。详见 MANUAL 坑 6。
+
+### 14.7 修正：`DevToolsActivePort` 的读取优先级
+
+之前假定 `<profile>\DevToolsActivePort` 总是当前有效端口。**只在
+`--remote-debugging-port=0`（自动分配）时才成立** —— 此时 Chromium 会写该文件。
+
+指定**固定端口**时 Chromium **不写也不刷新**它，目录里那份是上一次运行残留的，
+端口号是错的。症状：`roxy-open.ps1 -List` 报 `port=51452`，实际监听在 `9335`。
+
+正确优先级：**命令行 `--remote-debugging-port=N`（N>0）优先，否则才读 `DevToolsActivePort`**。
+`roxy-open.ps1` 已按此实现。

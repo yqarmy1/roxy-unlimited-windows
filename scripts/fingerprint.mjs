@@ -33,14 +33,25 @@ export const decLumi = (b64) => {
   return Buffer.concat([d.update(raw.subarray(0, raw.length - 16)), d.final()]).toString('utf8');
 };
 
-// ---------- paths ----------
-export const ROOT    = path.join(process.env.APPDATA, 'RoxyBrowser');
-export const CACHE   = path.join(ROOT, 'browser-cache');
-export const BIN     = path.join(ROOT, 'chrome-bin');
-export const INSTALL = path.join(process.env.LOCALAPPDATA, 'Programs', 'RoxyBrowser');
-export const EXT_DIR = path.join(INSTALL, 'resources', 'app.asar.unpacked', 'resources', 'automation-control-extension');
+// ---------- paths：自动发现，不写死 ----------
+import { resolveRoxyPaths, explainFailure, redactPath, show } from './paths.mjs';
 
-export const profileDir = (dirId) => path.join(CACHE, dirId);
+let _P = null;
+let _PErr = null;
+/** 解析一次并缓存；opts 只在首次生效（{dataDir, installDir}） */
+export function getPaths(opts) {
+  if (_P) return _P;
+  try { _P = resolveRoxyPaths(opts ?? {}); }
+  catch (e) { _PErr = e; _P = resolveRoxyPaths({ dataDir: process.env.ROXY_HOME ?? process.cwd() }); }
+  return _P;
+}
+export function pathsReady(opts) { return getPaths(opts).ok; }
+export function pathHelp(opts, fullPaths = false) { return explainFailure(getPaths(opts), fullPaths); }
+export { explainFailure, redactPath, show };
+
+const cacheDir = () => getPaths().browserCacheDir;
+
+export const profileDir = (dirId) => path.join(cacheDir(), dirId);
 export const lumiPath   = (dirId) => path.join(profileDir(dirId), 'lumi.conf');
 export const isDirId    = (s) => typeof s === 'string' && /^[0-9a-f]{32}$/i.test(s);
 export const hasProfile = (dirId) => isDirId(dirId) && fs.existsSync(lumiPath(dirId));
@@ -51,7 +62,9 @@ export function readFingerprint(dirId) {
 
 // newest profile that actually has a lumi.conf — used as the structural template
 export function newestTemplateDir() {
-  const rows = fs.readdirSync(CACHE, { withFileTypes: true })
+  const dir = cacheDir();
+  if (!dir || !fs.existsSync(dir)) return null;
+  const rows = fs.readdirSync(dir, { withFileTypes: true })
     .filter((e) => e.isDirectory() && fs.existsSync(lumiPath(e.name)))
     .map((e) => ({ id: e.name, t: fs.statSync(lumiPath(e.name)).mtimeMs }))
     .sort((a, b) => b.t - a.t);
@@ -117,16 +130,18 @@ const rfloat = (a, b, p = 6) => +(a + Math.random() * (b - a)).toFixed(p);
 const NOISE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const noiseStr = (n) => Array.from(crypto.randomBytes(n)).map((b) => NOISE_ALPHABET[b % 32]).join('');
 
-export function coreExe() {
-  const c = fs.readdirSync(BIN, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => ({ exe: path.join(BIN, e.name, 'RoxyChrome.exe'), rank: /^\d+$/.test(e.name) ? parseInt(e.name, 10) : -1 }))
-    .filter((x) => fs.existsSync(x.exe))
-    .sort((a, b) => b.rank - a.rank);
-  if (!c.length) throw new Error('RoxyChrome.exe not found under ' + BIN);
-  return c[0].exe;
+export function coreExe(opts) {
+  const P = getPaths(opts);
+  if (!P.coreExe) {
+    // 不要抛裸 ENOENT —— 直接告诉用户缺什么、去哪儿装
+    const err = new Error('RoxyChrome.exe 未找到\n' + explainFailure(P));
+    err.code = 'ROXY_CORE_NOT_FOUND';
+    err.paths = P;
+    throw err;
+  }
+  return P.coreExe;
 }
-export const coreVersion = () => path.basename(path.dirname(coreExe()));
+export const coreVersion = (opts) => getPaths(opts).coreVersion ?? path.basename(path.dirname(coreExe(opts)));
 
 export function parseProxy(s) {
   let type = 'socks5', rest = String(s), username = '', password = '';
@@ -242,7 +257,9 @@ export function buildFingerprint(o) {
 
   // ---- per-profile cosmetics ----
   cfg.browserIconPath = path.join(userDataDir, 'chrome-icon.ico');
-  cfg.blockDomainPageFile = path.join(INSTALL, 'resources', 'app.asar.unpacked', 'dist', 'web', 'blockDomain.html');
+  // 安装目录可能不存在（只装了数据目录的机器），缺失就沿用模板里的值
+  const blockPage = getPaths().blockDomainPageFile;
+  if (blockPage) cfg.blockDomainPageFile = blockPage;
   cfg.taskBarIcon = { color: 'FF' + hex(3), text: String(rint(1, 9)) };
 
   // ---- local port whitelist ----
@@ -282,15 +299,55 @@ export function createProfileOnDisk(opts) {
   fs.mkdirSync(userDataDir, { recursive: true });
 
   const tplDir = opts.from ?? newestTemplateDir();
-  if (!tplDir) throw new Error('no existing profile available as a structural template');
+  if (!tplDir) {
+    // 全新机器上 browser-cache 可能是空的：此时用内置骨架当模板
+    const template = skeletonTemplate();
+    const built = buildFingerprint({ ...opts, template, dirId, userDataDir });
+    fs.writeFileSync(lumiPath(dirId), encLumi(JSON.stringify(built.cfg)));
+    return { dirId, userDataDir, ...built, templateFrom: '(built-in skeleton)' };
+  }
   const template = readFingerprint(tplDir);
-  if (!template) throw new Error(`template ${tplDir} could not be decrypted`);
+  if (!template) throw new Error(`模板档案 ${tplDir} 无法解密（lumi.conf 损坏？）`);
 
   const built = buildFingerprint({ ...opts, template, dirId, userDataDir });
 
-  const icon = path.join(CACHE, tplDir, 'chrome-icon.ico');
+  const icon = path.join(cacheDir(), tplDir, 'chrome-icon.ico');
   if (fs.existsSync(icon)) fs.copyFileSync(icon, built.cfg.browserIconPath);
 
   fs.writeFileSync(lumiPath(dirId), encLumi(JSON.stringify(built.cfg)));
-  return { dirId, userDataDir, ...built };
+  return { dirId, userDataDir, ...built, templateFrom: tplDir };
+}
+
+/** 机器上还没有任何档案时用的最小骨架，字段与官方 lumi.conf 结构一致 */
+export function skeletonTemplate() {
+  return {
+    computerName: 'DESKTOP-00000000', macAddress: '000000000000',
+    searchEngine: { name: 'Google' }, windowName: '',
+    chromeVersion: '', chromeType: 'Google Chrome', userAgent: '',
+    audioBuffer: { version: '2', enableAudioBufferNoise: true, audioBufferNoiseValue: 0.5, audioBufferNoiseInterval: 100 },
+    canvasContext: { enableCanvasContextNoise: true, canvasContextNoiseValue: '00000000000000000000000000000000', canvasContextNoiseValueV2: 1000 },
+    clientRects: { enable: true, clientRectsNoiseFactorX: 0.1, clientRectsNoiseFactorY: 0.1 },
+    WebGL: { webglRenderer: '', webglVendor: '', enableWebGLRendererNoise: true, webGLRendererNoiseInterval: 1, webGLRendererNoiseValue: '0000000000000000' },
+    WebGPU: { mode: 'webgl', vendor: '' },
+    doNotTrack: true,
+    geoLocation: { mode: 'allow', enableFakeLocationData: true, locationLatitude: null, locationLongitude: null, locationAccuracy: null, locationAltitude: null },
+    blockImages: false, ignoreCertificateErrors: false, disablePlayVideo: false,
+    disablePlaySound: false, disablePasswordSaveTips: false,
+    navigator: { platform: 'Win32', hardwareConcurrency: 8, maxTouchPoints: 0, deviceMemory: 8, plugins: [] },
+    userAgentMetadata: { platform: 'Windows', mobile: false, platformVersion: '15.0.0' },
+    portScan: { enablePortScanWhiteList: true, portScanWhiteList: '45535;' },
+    screen: { width: 1920, height: 1080, availWidth: 1920, availHeight: 1080, colorDepth: 24, pixelDepth: 24 },
+    speechSynthesis: { enable: true, voices: [] },
+    webRtcMode: 'disableOk',
+    ssl: { cipherSuiteBlacklist: '' },
+    fproxy: {}, autofillWebSite: {}, autofillWebSiteMult: '',
+    taskBarIcon: { color: 'FF6000d7', text: '1' },
+    blockDomainList: '', blockDomainPageFile: '',
+    simulation: { delay: 100, delayRange: [100, 1000], enable: true, humanNoise: true, shortcutKey: 'Ctrl Shift E' },
+    SessionStorageSyncConfig: { enable: false, list: [] },
+    virtualCameraInfo: { enable: false, uploadToolTipText: '', selectFileDialogTitle: '' },
+    battery: { enable: false, charging: false, chargingTime: '', dischargingTime: '', level: '' },
+    network: { enable: false, nettype: '', effectiveType: '', downlink: '', downlinkMax: '', rtt: 0, saveData: false },
+    bluetooth: { enable: false, bluetoothAdapter: false },
+  };
 }
